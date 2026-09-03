@@ -29,11 +29,19 @@ def test_assignment_shows_locals_after_the_line() -> None:
         y = x + 2
     [trace] = tracer.traces()
     lines = spans_of(trace, "line")
-    assert lines[0].line == "x = 1"
+    assert [span.line for span in lines] == ["x = 1", "y = x + 2"]
     assert lines[0].assignments == {"x": "1"}
-    assert lines[1].line == "y = x + 2"
     assert lines[1].assignments == {"y": "3"}
     assert isinstance(lines[0], LineSpan)
+
+
+def test_with_trace_line_is_not_captured() -> None:
+    tracer = Tracer()
+    with tracer.trace():
+        x = 1
+    [trace] = tracer.traces()
+    assert [span.line for span in trace.spans] == ["x = 1"]
+    assert all(".trace()" not in span.line for span in trace.spans)
 
 
 def test_function_call_and_return() -> None:

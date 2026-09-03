@@ -103,6 +103,7 @@ class Tracer(TracerContract):
         self._events: list[_Event] = []
         self._pending: dict[int, _PendingLine] = {}
         self._attached: list[types.FrameType] = []
+        self._entry_lines: set[tuple[int, int]] = set()
         self._rendering = False
 
     @contextmanager
@@ -150,10 +151,12 @@ class Tracer(TracerContract):
 
     def _install(self) -> None:
         self._attached = []
+        self._entry_lines = set()
         sys.settrace(self._callback)
         frame = sys._getframe().f_back
         while frame is not None:
             if self._should_trace(frame):
+                self._entry_lines.add((id(frame), frame.f_lineno))
                 frame.f_trace = self._callback
                 self._attached.append(frame)
             frame = frame.f_back
@@ -203,6 +206,8 @@ class Tracer(TracerContract):
 
     def _on_line(self, frame: types.FrameType) -> None:
         self._flush_frame(frame)
+        if (id(frame), frame.f_lineno) in self._entry_lines:
+            return
         self._pending[id(frame)] = _PendingLine(
             frame=frame,
             line_number=frame.f_lineno,
