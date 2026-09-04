@@ -1,4 +1,4 @@
-"""Execution tracer that records call, line, return, and exception spans."""
+"""Observation-action tracer built on per-code ``sys.monitoring`` events."""
 
 from __future__ import annotations
 
@@ -7,27 +7,29 @@ import io
 import linecache
 import os
 import sys
+import threading
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Iterator, Literal
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Iterator
 
 from pydantic import BaseModel, ConfigDict
 
-# BaseSpan.type is annotated as types.FrameType in the contract; pydantic cannot
-# build a schema for frame objects unless arbitrary types are allowed.
-_base_model_config = BaseModel.model_config
+# Contract annotates BaseSpan.type as types.FrameType.
+_saved_config = BaseModel.model_config
 BaseModel.model_config = ConfigDict(arbitrary_types_allowed=True)
-from tracer_contract import (  # noqa: E402
-    CallSpan,
-    ExceptionSpan,
-    LineSpan,
-    ReturnSpan,
-    Trace as ContractTrace,
-    Tracer as TracerContract,
-)
-
-BaseModel.model_config = _base_model_config
+try:
+    from tracer_contract import (  # noqa: E402
+        CallSpan,
+        ExceptionSpan,
+        LineSpan,
+        ReturnSpan,
+        Trace as ContractTrace,
+        Tracer as TracerContract,
+    )
+finally:
+    BaseModel.model_config = _saved_config
 
 __all__ = [
     "CallSpan",
@@ -39,6 +41,14 @@ __all__ = [
 ]
 
 TRACER_FILE = os.path.abspath(__file__)
+USER_FILENAME = "<user>"
+_TOOL_NAME = "cwm-tracer"
+_TOOL_IDS = (3, 4, 2, 1, 5, 0)
+_LOCAL_EVENTS = (
+    sys.monitoring.events.LINE
+    | sys.monitoring.events.PY_START
+    | sys.monitoring.events.PY_RETURN
+)
 
 _SKIP_MARKERS = (
     "/contextlib.py",
@@ -51,6 +61,7 @@ _SKIP_MARKERS = (
     "/ipykernel/",
     "/jupyter_client/",
     "/traitlets/",
+    "/prompt_toolkit/",
 )
 
 _OMIT_TYPES = (
@@ -69,24 +80,32 @@ _OMIT_TYPES = (
 
 _IGNORE_NAMES = frozenset(
     {
+        "__annotations__",
         "__builtins__",
         "__cached__",
-        "__doc__",
-        "__file__",
-        "__loader__",
-        "__name__",
-        "__package__",
-        "__spec__",
-        "__annotations__",
-        "__stdout__",
-        "__exception__",
-        "__return__",
-        "__module__",
         "__class__",
         "__dict__",
+        "__doc__",
+        "__exception__",
+        "__file__",
+        "__loader__",
+        "__module__",
+        "__name__",
+        "__package__",
+        "__return__",
+        "__spec__",
+        "__stdout__",
         "__weakref__",
     }
 )
+
+_STORE_OPS = {
+    "STORE_DEREF",
+    "STORE_FAST",
+    "STORE_FAST_MAYBE_NULL",
+    "STORE_GLOBAL",
+    "STORE_NAME",
+}
 
 Span = CallSpan | LineSpan | ReturnSpan | ExceptionSpan
 
@@ -96,80 +115,126 @@ class Trace(ContractTrace):
 
 
 class Tracer(TracerContract):
-    """Record observation-action spans while a ``with tracer.trace():`` block runs."""
+    """Record spans for the duration of ``with tracer.trace():``."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_spans: int | None = None) -> None:
+        self._max_spans = max_spans
         self._traces: list[Trace] = []
-        self._events: list[_Event] = []
+        self._spans: list[Span] = []
         self._pending: dict[int, _PendingLine] = {}
-        self._attached: list[types.FrameType] = []
-        self._entry_lines: set[tuple[int, int]] = set()
-        self._rendering = False
+        self._entry: set[tuple[int, int]] = set()
+        self._armed: set[types.CodeType] = set()
+        self._user_filename = ""
+        self._tool_id: int | None = None
+        self._thread = 0
+        self._live = False
+        self._busy = False
 
     @contextmanager
     def trace(self) -> Iterator[Tracer]:
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         old_out, old_err = sys.stdout, sys.stderr
-        old_hook = sys.gettrace()
-        self._events = []
+        self._spans = []
         self._pending = {}
-        self._rendering = False
+        self._busy = False
+        thread = threading.get_ident()
         try:
-            sys.stdout = stdout
-            sys.stderr = stderr
-            self._install()
+            sys.stdout = _Capture(old_out, out, thread)
+            sys.stderr = _Capture(old_err, err, thread)
+            self._start()
             yield self
+        except BaseException as exc:
+            self._record_exception(exc)
+            raise
         finally:
-            self._uninstall(old_hook)
-            self._flush_all()
             sys.stdout = old_out
             sys.stderr = old_err
+            self._stop()
             self._traces.append(
-                Trace(
-                    spans=self._to_spans(),
-                    stdout=stdout.getvalue(),
-                    stderr=stderr.getvalue(),
-                )
+                Trace(spans=self._spans, stdout=out.getvalue(), stderr=err.getvalue())
             )
+
+    def trace_str(self, src: str) -> Trace:
+        source = src if src.endswith("\n") else f"{src}\n"
+        compiled = compile(source, USER_FILENAME, "exec")
+        _prime_linecache(USER_FILENAME, source)
+        previous, self._user_filename = self._user_filename, USER_FILENAME
+        try:
+            with self.trace():
+                self._arm(compiled)
+                exec(compiled, {"__name__": "__main__"})  # noqa: S102
+        finally:
+            self._user_filename = previous
+        return self._traces[-1]
 
     def traces(self) -> list[Trace]:
         return list(self._traces)
 
-    def _callback(self, frame: types.FrameType, event: str, arg: Any) -> Any:
-        if self._rendering or not self._should_trace(frame):
-            return None
-        if event == "call":
-            self._on_call(frame)
-        elif event == "line":
-            self._on_line(frame)
-        elif event == "return":
-            self._on_return(frame, arg)
-        elif event == "exception":
-            self._on_exception(frame, arg)
-        return self._callback
+    def clear(self) -> None:
+        self._traces.clear()
 
-    def _install(self) -> None:
-        self._attached = []
-        self._entry_lines = set()
-        sys.settrace(self._callback)
-        frame = sys._getframe().f_back
+    def _start(self) -> None:
+        self._entry = set()
+        self._armed = set()
+        self._thread = threading.get_ident()
+        tool_id = self._tool_id = _acquire_tool_id()
+        events = sys.monitoring.events
+        sys.monitoring.register_callback(tool_id, events.LINE, self._on_line)
+        sys.monitoring.register_callback(tool_id, events.PY_START, self._on_start)
+        sys.monitoring.register_callback(tool_id, events.PY_RETURN, self._on_return)
+        sys.monitoring.set_events(tool_id, events.NO_EVENTS)
+        frame = sys._getframe()
         while frame is not None:
-            if self._should_trace(frame):
-                self._entry_lines.add((id(frame), frame.f_lineno))
-                frame.f_trace = self._callback
-                self._attached.append(frame)
+            if self._wanted(frame.f_code):
+                self._entry.add((id(frame), frame.f_lineno))
+                self._arm(frame.f_code)
             frame = frame.f_back
+        self._live = True
 
-    def _uninstall(self, old_hook: Any) -> None:
-        sys.settrace(old_hook)
-        for frame in self._attached:
-            if frame.f_trace is self._callback:
-                frame.f_trace = old_hook
-        self._attached = []
+    def _stop(self) -> None:
+        self._live = False
+        try:
+            self._flush_pending()
+        except Exception:
+            self._pending.clear()
+        self._disarm()
 
-    def _should_trace(self, frame: types.FrameType) -> bool:
-        filename = frame.f_code.co_filename
+    def _disarm(self) -> None:
+        tool_id = self._tool_id
+        if tool_id is None:
+            return
+        events = sys.monitoring.events
+        sys.monitoring.set_events(tool_id, events.NO_EVENTS)
+        none = events.NO_EVENTS
+        for code in self._armed:
+            try:
+                sys.monitoring.set_local_events(tool_id, code, none)
+            except ValueError:
+                pass
+        self._armed.clear()
+        sys.monitoring.register_callback(tool_id, events.LINE, None)
+        sys.monitoring.register_callback(tool_id, events.PY_START, None)
+        sys.monitoring.register_callback(tool_id, events.PY_RETURN, None)
+        try:
+            sys.monitoring.free_tool_id(tool_id)
+        except ValueError:
+            pass
+        self._tool_id = None
+
+    def _arm(self, code: types.CodeType) -> None:
+        tool_id = self._tool_id
+        if tool_id is None or code in self._armed:
+            return
+        sys.monitoring.set_local_events(tool_id, code, _LOCAL_EVENTS)
+        self._armed.add(code)
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType):
+                self._arm(const)
+
+    def _wanted(self, code: types.CodeType) -> bool:
+        filename = code.co_filename
+        if self._user_filename:
+            return filename == self._user_filename
         if filename.startswith("<frozen "):
             return False
         try:
@@ -178,9 +243,8 @@ class Tracer(TracerContract):
             path = filename.replace("\\", "/")
         if path == TRACER_FILE:
             return False
-        for marker in _SKIP_MARKERS:
-            if marker in path:
-                return False
+        if any(marker in path for marker in _SKIP_MARKERS):
+            return False
         if not filename.startswith("<"):
             for prefix in (sys.prefix, sys.base_prefix, sys.exec_prefix):
                 if prefix and path.startswith(
@@ -189,148 +253,168 @@ class Tracer(TracerContract):
                     return False
         return True
 
-    def _on_call(self, frame: types.FrameType) -> None:
-        if _is_module(frame):
+    def _frame(self, code: types.CodeType) -> types.FrameType | None:
+        if not self._live or self._busy or threading.get_ident() != self._thread:
+            return None
+        if not self._wanted(code):
+            return None
+        return _frame_for_code(code)
+
+    def _on_line(self, code: types.CodeType, line_number: int) -> Any:
+        frame = self._frame(code)
+        if frame is None:
+            return None
+        try:
+            self._see_line(frame, line_number)
+        except (RecursionError, Exception):
+            self._stop()
+        return None
+
+    def _on_start(self, code: types.CodeType, _offset: int) -> Any:
+        frame = self._frame(code)
+        if frame is None:
+            return None
+        try:
+            self._see_call(frame)
+        except (RecursionError, Exception):
+            self._stop()
+        return None
+
+    def _on_return(self, code: types.CodeType, _offset: int, retval: Any) -> Any:
+        frame = self._frame(code)
+        if frame is None:
+            return None
+        try:
+            self._see_return(frame, retval)
+        except (RecursionError, Exception):
+            self._stop()
+        return None
+
+    def _see_line(self, frame: types.FrameType, line_number: int) -> None:
+        self._flush_frame(frame)
+        if self._full() or (id(frame), line_number) in self._entry:
             return
-        caller = frame.f_back
-        if caller is not None:
-            self._flush_frame(caller)
-        self._events.append(
-            _Event(
-                kind="call",
+        self._pending[id(frame)] = _PendingLine(
+            frame=frame,
+            line_number=line_number,
+            line=_source(frame.f_code.co_filename, line_number),
+        )
+
+    def _see_call(self, frame: types.FrameType) -> None:
+        if frame.f_code.co_name == "<module>":
+            return
+        if frame.f_back is not None:
+            self._flush_frame(frame.f_back)
+        self._add(
+            CallSpan(
+                type="call",
                 line_number=frame.f_code.co_firstlineno,
-                line=_source_at(frame.f_code.co_filename, frame.f_code.co_firstlineno),
+                line=_source(frame.f_code.co_filename, frame.f_code.co_firstlineno),
                 arguments=self._snapshot(frame.f_locals),
             )
         )
 
-    def _on_line(self, frame: types.FrameType) -> None:
+    def _see_return(self, frame: types.FrameType, retval: Any) -> None:
         self._flush_frame(frame)
-        if (id(frame), frame.f_lineno) in self._entry_lines:
+        if frame.f_code.co_name == "<module>":
             return
-        self._pending[id(frame)] = _PendingLine(
-            frame=frame,
-            line_number=frame.f_lineno,
-            line=_source_line(frame),
-        )
-
-    def _on_return(self, frame: types.FrameType, retval: Any) -> None:
-        self._flush_frame(frame)
-        if _is_module(frame):
-            return
-        self._events.append(
-            _Event(
-                kind="return",
+        self._add(
+            ReturnSpan(
+                type="return",
                 line_number=frame.f_lineno,
-                line=_source_line(frame),
+                line=_source(frame.f_code.co_filename, frame.f_lineno),
                 return_value=self._format(retval),
             )
         )
 
-    def _on_exception(self, frame: types.FrameType, arg: Any) -> None:
-        self._flush_frame(frame)
-        exc_type, exc_value, _tb = arg
-        self._events.append(
-            _Event(
-                kind="exception",
-                line_number=frame.f_lineno,
-                line=_source_line(frame),
-                exception_type=getattr(exc_type, "__name__", str(exc_type)),
-                exception_value=str(exc_value),
-            )
-        )
+    def _record_exception(self, exc: BaseException) -> None:
+        if isinstance(exc, GeneratorExit):
+            return
+        traceback = exc.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if self._wanted(frame.f_code):
+                self._flush_frame(frame)
+                self._add(
+                    ExceptionSpan(
+                        type="exception",
+                        line_number=frame.f_lineno,
+                        line=_source(frame.f_code.co_filename, frame.f_lineno),
+                        exception_type=type(exc).__name__,
+                        exception_value=str(exc),
+                    )
+                )
+                return
+            traceback = traceback.tb_next
+
+    def _full(self) -> bool:
+        return self._max_spans is not None and len(self._spans) >= self._max_spans
+
+    def _add(self, span: Span) -> None:
+        if self._full():
+            return
+        self._spans.append(span)
+        if self._full():
+            self._live = False
+            self._pending.clear()
+            self._disarm()
 
     def _flush_frame(self, frame: types.FrameType) -> None:
         pending = self._pending.pop(id(frame), None)
         if pending is not None:
-            self._emit_line(pending)
+            self._emit(pending, snapshot=True)
 
-    def _flush_all(self) -> None:
-        for pending in list(self._pending.values()):
-            self._emit_line(pending)
+    def _flush_pending(self) -> None:
+        pending = list(self._pending.values())
         self._pending.clear()
+        live = _stack_ids()
+        for item in pending:
+            self._emit(item, snapshot=id(item.frame) in live)
 
-    def _emit_line(self, pending: _PendingLine) -> None:
-        current = self._snapshot_frame(pending.frame)
-        assigned = assigned_names(pending.frame.f_code, pending.line_number)
-        self._events.append(
-            _Event(
-                kind="line",
+    def _emit(self, pending: _PendingLine, *, snapshot: bool) -> None:
+        assignments: dict[str, str] = {}
+        if snapshot:
+            try:
+                bound = self._snapshot_frame(pending.frame)
+                names = assigned_names(pending.frame.f_code, pending.line_number)
+                assignments = {name: bound[name] for name in names if name in bound}
+            except Exception:
+                assignments = {}
+        self._add(
+            LineSpan(
+                type="line",
                 line_number=pending.line_number,
                 line=pending.line,
-                assignments={
-                    name: current[name] for name in assigned if name in current
-                },
+                assignments=assignments,
             )
         )
-
-    def _to_spans(self) -> list[Span]:
-        spans: list[Span] = []
-        for event in self._events:
-            if event.kind == "call":
-                spans.append(
-                    CallSpan(
-                        type="call",
-                        line_number=event.line_number,
-                        line=event.line,
-                        arguments=event.arguments,
-                    )
-                )
-            elif event.kind == "line":
-                spans.append(
-                    LineSpan(
-                        type="line",
-                        line_number=event.line_number,
-                        line=event.line,
-                        assignments=event.assignments,
-                    )
-                )
-            elif event.kind == "return":
-                spans.append(
-                    ReturnSpan(
-                        type="return",
-                        line_number=event.line_number,
-                        line=event.line,
-                        return_value=event.return_value,
-                    )
-                )
-            else:
-                spans.append(
-                    ExceptionSpan(
-                        type="exception",
-                        line_number=event.line_number,
-                        line=event.line,
-                        exception_type=event.exception_type,
-                        exception_value=event.exception_value,
-                    )
-                )
-        return spans
 
     def _snapshot_frame(self, frame: types.FrameType) -> dict[str, str]:
         bound = self._snapshot(frame.f_globals)
         bound.update(self._snapshot(frame.f_locals))
         return bound
 
-    def _snapshot(self, namespace: dict[str, Any]) -> dict[str, str]:
-        self._rendering = True
+    def _snapshot(self, namespace: Any) -> dict[str, str]:
+        self._busy = True
         try:
+            items = list(namespace.items())
             out: dict[str, str] = {}
-            for name, value in namespace.items():
-                if name in _IGNORE_NAMES or name.startswith("__"):
-                    continue
-                if _is_internal(value):
+            for name, value in items:
+                if name in _IGNORE_NAMES or name.startswith("__") or _internal(value):
                     continue
                 out[name] = format_value(value)
             return out
+        except Exception:
+            return {}
         finally:
-            self._rendering = False
+            self._busy = False
 
     def _format(self, value: Any) -> str:
-        self._rendering = True
+        self._busy = True
         try:
             return format_value(value)
         finally:
-            self._rendering = False
+            self._busy = False
 
 
 @dataclass
@@ -340,19 +424,59 @@ class _PendingLine:
     line: str
 
 
-@dataclass
-class _Event:
-    kind: Literal["call", "line", "return", "exception"]
-    line_number: int
-    line: str
-    arguments: dict[str, str] = field(default_factory=dict)
-    assignments: dict[str, str] = field(default_factory=dict)
-    return_value: str = "None"
-    exception_type: str = ""
-    exception_value: str = ""
+class _Capture:
+    """Thread-local stdout/stderr capture that leaves IPython's stream alone."""
+
+    def __init__(self, original: Any, buf: io.StringIO, thread_id: int) -> None:
+        self._original = original
+        self._buf = buf
+        self._thread_id = thread_id
+
+    def write(self, data: str) -> int:
+        if threading.get_ident() == self._thread_id:
+            return self._buf.write(data)
+        return self._original.write(data)
+
+    def flush(self) -> None:
+        if threading.get_ident() == self._thread_id:
+            self._buf.flush()
+        else:
+            self._original.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
 
 
-def assigned_names(code: types.CodeType, lineno: int) -> list[str]:
+def _acquire_tool_id() -> int:
+    for tool_id in _TOOL_IDS:
+        try:
+            sys.monitoring.use_tool_id(tool_id, _TOOL_NAME)
+            return tool_id
+        except ValueError:
+            continue
+    raise RuntimeError("no free sys.monitoring tool id")
+
+
+def _stack_ids() -> set[int]:
+    ids: set[int] = set()
+    frame = sys._getframe()
+    while frame is not None:
+        ids.add(id(frame))
+        frame = frame.f_back
+    return ids
+
+
+def _frame_for_code(code: types.CodeType) -> types.FrameType | None:
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_code is code:
+            return frame
+        frame = frame.f_back
+    return None
+
+
+@lru_cache(maxsize=2048)
+def assigned_names(code: types.CodeType, lineno: int) -> tuple[str, ...]:
     names: list[str] = []
     seen: set[str] = set()
     for instr in dis.get_instructions(code):
@@ -362,11 +486,11 @@ def assigned_names(code: types.CodeType, lineno: int) -> list[str]:
             if name not in seen:
                 seen.add(name)
                 names.append(name)
-    return names
+    return tuple(names)
 
 
 def format_value(value: Any, *, depth: int = 0) -> str:
-    if _is_internal(value):
+    if _internal(value):
         return type(value).__name__
     if isinstance(value, (int, float, complex, bool)) or value is None:
         return repr(value)
@@ -378,11 +502,11 @@ def format_value(value: Any, *, depth: int = 0) -> str:
         parts = [
             f"{key!r}: {format_value(item, depth=depth + 1)}"
             for key, item in value.items()
-            if not _is_internal(item)
+            if not _internal(item)
         ]
         return "{" + ", ".join(parts) + "}"
     if isinstance(value, (list, tuple, set, frozenset)):
-        brackets = (
+        left, right = (
             ("[", "]")
             if isinstance(value, list)
             else ("(", ")")
@@ -390,13 +514,11 @@ def format_value(value: Any, *, depth: int = 0) -> str:
             else ("{", "}")
         )
         parts = [
-            format_value(item, depth=depth + 1)
-            for item in value
-            if not _is_internal(item)
+            format_value(item, depth=depth + 1) for item in value if not _internal(item)
         ]
         if isinstance(value, tuple) and len(parts) == 1:
             return f"({parts[0]},)"
-        return brackets[0] + ", ".join(parts) + brackets[1]
+        return left + ", ".join(parts) + right
     attrs = getattr(value, "__dict__", None)
     if isinstance(attrs, dict):
         fields = {
@@ -404,7 +526,7 @@ def format_value(value: Any, *, depth: int = 0) -> str:
             for name, item in attrs.items()
             if name not in _IGNORE_NAMES
             and not name.startswith("__")
-            and not _is_internal(item)
+            and not _internal(item)
         }
         body = ", ".join(f"{name}={item}" for name, item in fields.items())
         return f"{type(value).__name__}({body})"
@@ -412,20 +534,20 @@ def format_value(value: Any, *, depth: int = 0) -> str:
     return text[:77] + "..." if len(text) > 80 else text
 
 
-def _is_internal(value: Any) -> bool:
-    return isinstance(value, _OMIT_TYPES)
+def _internal(value: Any) -> bool:
+    try:
+        return isinstance(value, _OMIT_TYPES)
+    except Exception:
+        return True
 
 
-def _is_module(frame: types.FrameType) -> bool:
-    return frame.f_code.co_name == "<module>"
-
-
-def _source_line(frame: types.FrameType) -> str:
-    return _source_at(frame.f_code.co_filename, frame.f_lineno)
-
-
-def _source_at(filename: str, lineno: int) -> str:
+def _source(filename: str, lineno: int) -> str:
     return linecache.getline(filename, lineno).strip()
+
+
+def _prime_linecache(filename: str, source: str) -> None:
+    lines = source.splitlines(keepends=True)
+    linecache.cache[filename] = (len(source), None, lines, filename)
 
 
 def _instruction_line(instr: dis.Instruction) -> int | None:
@@ -437,15 +559,8 @@ def _instruction_line(instr: dis.Instruction) -> int | None:
 
 
 def _store_targets(instr: dis.Instruction) -> list[str]:
-    opname = instr.opname
-    argval = instr.argval
-    if opname in {
-        "STORE_FAST",
-        "STORE_NAME",
-        "STORE_GLOBAL",
-        "STORE_DEREF",
-        "STORE_FAST_MAYBE_NULL",
-    }:
+    opname, argval = instr.opname, instr.argval
+    if opname in _STORE_OPS:
         return [argval] if isinstance(argval, str) else []
     if opname == "STORE_FAST_STORE_FAST" and isinstance(argval, tuple):
         return [name for name in argval if isinstance(name, str)]

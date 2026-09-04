@@ -22,6 +22,51 @@ def test_is_contract_tracer() -> None:
     assert Tracer().traces() == []
 
 
+def test_clear_drops_recorded_traces() -> None:
+    tracer = Tracer()
+    with tracer.trace():
+        x = 1
+    tracer.trace_str("y = 2\n")
+    assert len(tracer.traces()) == 2
+    tracer.clear()
+    assert tracer.traces() == []
+    with tracer.trace():
+        z = 3
+    assert len(tracer.traces()) == 1
+    assert by_line(tracer.traces()[0], "z = 3")
+
+
+def test_max_spans_caps_each_trace() -> None:
+    tracer = Tracer(max_spans=2)
+    with tracer.trace():
+        a = 1
+        b = 2
+        c = 3
+    [trace] = tracer.traces()
+    assert len(trace.spans) == 2
+    assert [span.line for span in trace.spans] == ["a = 1", "b = 2"]
+    with tracer.trace():
+        d = 4
+        e = 5
+        f = 6
+    traces = tracer.traces()
+    assert len(traces) == 2
+    assert [span.line for span in traces[1].spans] == ["d = 4", "e = 5"]
+
+
+def test_max_spans_survives_deep_recursion() -> None:
+    tracer = Tracer(max_spans=20)
+    tracer.trace_str(
+        "def rec(n):\n"
+        "    if n == 0:\n"
+        "        return 0\n"
+        "    return rec(n - 1) + 1\n"
+        "rec(300)\n"
+    )
+    [trace] = tracer.traces()
+    assert len(trace.spans) == 20
+
+
 def test_assignment_shows_locals_after_the_line() -> None:
     tracer = Tracer()
     with tracer.trace():
@@ -356,3 +401,52 @@ def test_line_numbers_are_positive_and_source_is_stripped() -> None:
     for span in trace.spans:
         assert span.line_number >= 1
         assert span.line == span.line.strip()
+
+
+def test_trace_str_records_snippet() -> None:
+    tracer = Tracer()
+    returned = tracer.trace_str("x = 1\ny = x + 2\n")
+    [trace] = tracer.traces()
+    assert returned is trace
+    lines = spans_of(trace, "line")
+    assert [span.line for span in lines] == ["x = 1", "y = x + 2"]
+    assert lines[0].assignments == {"x": "1"}
+    assert lines[1].assignments == {"y": "3"}
+    assert lines[0].line_number == 1
+    assert not any(
+        ".trace()" in span.line or "exec(" in span.line for span in trace.spans
+    )
+
+
+def test_trace_str_function_call() -> None:
+    tracer = Tracer()
+    tracer.trace_str("def add(a, b):\n    return a + b\n\nadd(2, 3)\n")
+    [trace] = tracer.traces()
+    assert any(
+        span.type == "call" and span.arguments == {"a": "2", "b": "3"}
+        for span in trace.spans
+    )
+    assert any(
+        span.type == "return" and span.return_value == "5" for span in trace.spans
+    )
+
+
+def test_trace_str_captures_stdio(capsys: pytest.CaptureFixture[str]) -> None:
+    tracer = Tracer()
+    tracer.trace_str('import sys\nprint("hello")\nprint("world", file=sys.stderr)\n')
+    leaked = capsys.readouterr()
+    assert "hello" not in leaked.out
+    assert "world" not in leaked.err
+    [trace] = tracer.traces()
+    assert trace.stdout == "hello\n"
+    assert trace.stderr == "world\n"
+
+
+def test_trace_str_records_exception() -> None:
+    tracer = Tracer()
+    with pytest.raises(ZeroDivisionError):
+        tracer.trace_str("1 / 0")
+    [trace] = tracer.traces()
+    exceptions = spans_of(trace, "exception")
+    assert exceptions
+    assert exceptions[0].exception_type == "ZeroDivisionError"

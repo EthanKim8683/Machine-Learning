@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pydantic import BaseModel
 import types
-from typing import Literal
+from typing import Literal, Optional
 
 
 class BaseSpan(BaseModel):
@@ -40,10 +40,22 @@ class Trace(BaseModel):
 
 class Tracer(ABC):
     @abstractmethod
+    def __init__(self, max_spans: Optional[int] = None):
+        pass
+
+    @abstractmethod
     @contextmanager
     def trace(self):
         pass
 
     @abstractmethod
+    def trace_str(self, src: str):
+        pass
+
+    @abstractmethod
     def traces(self) -> list[Trace]:
+        pass
+
+    @abstractmethod
+    def clear(self):
         pass
