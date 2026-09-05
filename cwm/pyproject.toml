@@ -1,0 +1,28 @@
+[project]
+name = "cwm"
+version = "0.1.0"
+description = "Code world model tracer and fine-tuning experiments"
+readme = "README.txt"
+requires-python = ">=3.12"
+dependencies = [
+    "bitsandbytes>=0.50.2",
+    "datasets",
+    "ipykernel",
+    "jupyter",
+    "matplotlib",
+    "peft>=0.20.0",
+    "pydantic",
+    "seaborn",
+    "tqdm",
+    "transformers",
+    "trl",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
