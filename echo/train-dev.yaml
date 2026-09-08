@@ -1,6 +1,6 @@
 resources:
   infra: runpod
-  accelerators: L40S:4
-  disk_size: 512
+  accelerators: L4:1
+  disk_size: 64
 secrets:
   WANDB_API_KEY: null
