@@ -1,0 +1,13 @@
+resources:
+  infra: runpod
+  accelerators: L40S:4
+  disk_size: 512
+workdir:
+  url: https://github.com/NovaSky-AI/SkyRL.git
+secrets:
+  WANDB_API_KEY: null
+# See https://docs.skyrl.ai/docs/getting-started/quickstart
+setup: |
+  uv run --isolated examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+run: |
+  bash examples/train/gsm8k/run_gsm8k.sh trainer.epochs=3
