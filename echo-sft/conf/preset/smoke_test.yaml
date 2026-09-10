@@ -1,0 +1,5 @@
+# @package _global_
+
+dataset:
+  split: "xml[:2]"
+model: "yujiepan/qwen2.5-tiny-random"
