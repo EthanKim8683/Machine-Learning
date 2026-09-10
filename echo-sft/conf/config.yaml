@@ -1,16 +1,10 @@
-defaults:
-  - _self_
-  - preset: null
-  
 model:
-  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  pretrained_model_name_or_path: "yujiepan/qwen2.5-tiny-random"
 
 # dataset should have columns `messages` and `resolved`
 dataset:
   path: "SWE-bench/SWE-smith-trajectories"
-  split: "xml"
+  split: "xml[:1]"
 
 trainer:
   output_dir: "trainer_outputs"
-  bf16: true
-  gradient_checkpointing: true

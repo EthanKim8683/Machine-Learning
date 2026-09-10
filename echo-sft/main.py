@@ -1,21 +1,15 @@
 import json
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
+from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 
 
-@hydra.main(
-    version_base="1.2",
-    config_path="conf",
-    config_name="config.yaml",
-)
+@hydra.main(version_base="1.2")
 def main(cfg: DictConfig):
-    model_kwargs = OmegaConf.to_container(cfg.model)
-    model_name = model_kwargs.pop("name")
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(**OmegaConf.to_container(cfg.model))
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.pretrained_model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

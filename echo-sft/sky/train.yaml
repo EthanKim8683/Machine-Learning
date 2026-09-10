@@ -1,0 +1,27 @@
+resources:
+  infra: runpod
+  accelerators: L40S:1
+  disk_size: 256
+
+workdir: .
+
+envs:
+  WANDB_PROJECT: echo-sft
+  WANDB_LOG_MODEL: false
+
+secrets:
+  WANDB_API_KEY: null
+
+setup: |
+  uv sync
+
+run: |
+  uv run main.py \
+    model.pretrained_model_name_or_path="Qwen/Qwen2.5-Coder-7B-Instruct" \
+    dataset.path="SWE-bench/SWE-smith-trajectories" \
+    dataset.split="xml" \
+    +trainer.bf16=true \
+    +trainer.gradient_checkpointing=true \
+    +trainer.report_to=wandb \
+    +trainer.run_name=train \
+    +trainer.max_length=32768
