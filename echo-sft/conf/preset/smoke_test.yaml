@@ -2,4 +2,9 @@
 
 dataset:
   split: "xml[:2]"
-model: "yujiepan/qwen2.5-tiny-random"
+
+model:
+  name: "yujiepan/qwen2.5-tiny-random"
+
+trainer:
+  bf16: false

@@ -2,8 +2,15 @@ defaults:
   - _self_
   - preset: null
 
-# dataset should have columns "messages" and "resolved"
+# dataset should have columns `messages` and `resolved`
 dataset:
-  name: "SWE-bench/SWE-smith-trajectories"
+  path: "SWE-bench/SWE-smith-trajectories"
   split: "xml"
-model: "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+model:
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  
+trainer:
+  output_dir: "trainer_outputs"
+  bf16: true
+  gradient_checkpointing: true

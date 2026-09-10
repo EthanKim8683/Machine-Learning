@@ -1,8 +1,8 @@
 import json
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from datasets import load_dataset
-from transformers import AutoTokenizer, DataCollatorForSeq2Seq
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
 from trl import SFTTrainer, SFTConfig
 
 
@@ -12,7 +12,10 @@ from trl import SFTTrainer, SFTConfig
     config_name="config.yaml",
 )
 def main(cfg: DictConfig):
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+    model_kwargs = OmegaConf.to_container(cfg.model)
+    model_name = model_kwargs.pop("name")
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -77,7 +80,7 @@ def main(cfg: DictConfig):
             "labels": batch_labels,
         }
 
-    dataset = load_dataset(cfg.dataset.name, split=cfg.dataset.split)
+    dataset = load_dataset(**OmegaConf.to_container(cfg.dataset))
     tokenized_dataset = dataset.map(
         tokenize_batch,
         batched=True,
@@ -89,11 +92,9 @@ def main(cfg: DictConfig):
         pad_to_multiple_of=8,
     )
 
-    trainer_args = SFTConfig(
-        output_dir="trainer_outputs",
-    )
+    trainer_args = SFTConfig(**OmegaConf.to_container(cfg.trainer))
     trainer = SFTTrainer(
-        model=cfg.model,
+        model=model,
         args=trainer_args,
         train_dataset=tokenized_dataset,
         data_collator=data_collator,
