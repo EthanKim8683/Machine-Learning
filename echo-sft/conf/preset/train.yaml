@@ -1,0 +1,20 @@
+# @package _global_
+
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen2.5-Coder-7B-Instruct"
+tokenizer:
+  model_max_length: 32768
+
+dataset:
+  path: "SWE-bench/SWE-smith-trajectories"
+  split: "xml"
+
+data_collator:
+  pad_to_multiple_of: 8
+
+trainer:
+  observation_loss_weight: 0.1
+  bf16: true
+  gradient_checkpointing: true
+  report_to: wandb
+  run_name: train

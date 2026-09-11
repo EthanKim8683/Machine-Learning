@@ -1,0 +1,13 @@
+# @package _global_
+
+model:
+  pretrained_model_name_or_path: "yujiepan/qwen2.5-tiny-random"
+tokenizer:
+  model_max_length: 256
+
+dataset:
+  path: "SWE-bench/SWE-smith-trajectories"
+  split: "xml[:1]"
+
+trainer:
+  use_cpu: true
