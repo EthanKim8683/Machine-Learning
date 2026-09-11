@@ -16,6 +16,7 @@ secrets:
 setup: |
   uv sync
   uv pip install wandb bitsandbytes
+  uv run dataset.py
 
 run: |
-  uv run main.py preset=train
+  uv run train.py preset=full

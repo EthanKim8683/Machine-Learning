@@ -121,7 +121,7 @@ class MyDataCollator(DataCollatorForSeq2Seq):
 @dataclass
 class MyTrainingArguments(TrainingArguments):
     observation_loss_weight: float = 0.1
-    # TODO: add config to enable chunked cross entropy
+    # TODO: add config to enable/disable chunked cross entropy
     chunked_cross_entropy_chunk_size: int = 256
 
 

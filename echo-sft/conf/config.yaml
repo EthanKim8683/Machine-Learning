@@ -2,6 +2,10 @@ defaults:
   - _self_
   - preset: null
 
+hydra:
+  job:
+    chdir: false
+
 # model should use ChatML format
 model:
   pretrained_model_name_or_path: ???
