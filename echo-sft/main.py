@@ -1,13 +1,20 @@
 import json
 from dataclasses import dataclass
 import torch
+import torch.nn.functional as F
 import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
-from transformers.trainer_pt_utils import LabelSmoother
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
+)
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from datasets import load_dataset
-from trl import SFTTrainer, SFTConfig
+
 
 IM_START_TOKEN = "<|im_start|>"
 IM_END_TOKEN = "<|im_end|>"
@@ -16,54 +23,59 @@ ASSISTANT_TOKEN = "assistant"
 
 
 def tokenize_dataset(dataset, tokenizer):
-    [im_start_id] = tokenizer.encode(IM_START_TOKEN)
-    [im_end_id] = tokenizer.encode(IM_END_TOKEN)
-    [user_id] = tokenizer.encode(USER_TOKEN)
-    [assistant_id] = tokenizer.encode(ASSISTANT_TOKEN)
+    (
+        im_start_id,
+        im_end_id,
+        user_id,
+        assistant_id,
+    ) = tokenizer.convert_tokens_to_ids(
+        [
+            IM_START_TOKEN,
+            IM_END_TOKEN,
+            USER_TOKEN,
+            ASSISTANT_TOKEN,
+        ],
+    )
 
     def tokenize_batch(batch):
-        batch_messages = [json.loads(messages) for messages in batch["messages"]]
-        batch_input_ids = tokenizer.apply_chat_template(
-            batch_messages,
+        messages_batch = [json.loads(messages) for messages in batch["messages"]]
+        input_ids_batch = tokenizer.apply_chat_template(
+            messages_batch,
             tokenize=True,
             truncation=True,
             return_dict=False,
         )
-        batch_action_labels = []
-        batch_observation_labels = []
-        for input_ids, resolved in zip(batch_input_ids, batch["resolved"]):
-            action_labels = []
-            observation_labels = []
-            turn = ""
+
+        labels_batch = []
+        action_mask_batch = []
+        observation_mask_batch = []
+        for input_ids, resolved in zip(input_ids_batch, batch["resolved"]):
+            labels = []
+            action_mask = []
+            observation_mask = []
+            role_id = -1
             for i, input_id in enumerate(input_ids):
-                if turn == "user":
-                    action_labels.append(-100)
-                    observation_labels.append(input_id)
-                elif turn == "assistant":
-                    action_labels.append(input_id if resolved else -100)
-                    observation_labels.append(-100)
-                else:
-                    action_labels.append(-100)
-                    observation_labels.append(-100)
+                is_action = role_id == assistant_id and resolved
+                is_observation = role_id == user_id
+
+                labels.append(input_id if is_action or is_observation else -100)
+                action_mask.append(1 if is_action else 0)
+                observation_mask.append(1 if is_observation else 0)
 
                 if i - 1 >= 0 and input_ids[i - 1] == im_start_id:
-                    if input_id == user_id:
-                        turn = "user"
-                    elif input_id == assistant_id:
-                        turn = "assistant"
-                    else:
-                        turn = ""
-
+                    role_id = input_id
                 if input_id == im_end_id:
-                    turn = ""
+                    role_id = -1
 
-            batch_action_labels.append(action_labels)
-            batch_observation_labels.append(observation_labels)
+            labels_batch.append(labels)
+            action_mask_batch.append(action_mask)
+            observation_mask_batch.append(observation_mask)
 
         return {
-            "input_ids": batch_input_ids,
-            "action_labels": batch_action_labels,
-            "observation_labels": batch_observation_labels,
+            "input_ids": input_ids_batch,
+            "labels": labels_batch,
+            "action_mask": action_mask_batch,
+            "observation_mask": observation_mask_batch,
         }
 
     return dataset.map(
@@ -73,67 +85,106 @@ def tokenize_dataset(dataset, tokenizer):
     )
 
 
-class ECHODataCollator(DataCollatorForSeq2Seq):
+class MyDataCollator(DataCollatorForSeq2Seq):
     def __call__(self, features, return_tensors=None):
         if return_tensors is None:
             return_tensors = self.return_tensors
 
-        raw_batch_action_labels = []
-        raw_batch_observation_labels = []
+        action_mask_batch = []
+        observation_mask_batch = []
         for feature in features:
-            raw_batch_action_labels.append(feature.pop("action_labels"))
-            raw_batch_observation_labels.append(feature.pop("observation_labels"))
+            action_mask_batch.append(feature.pop("action_mask"))
+            observation_mask_batch.append(feature.pop("observation_mask"))
 
         batch = super().__call__(features, return_tensors)
 
-        batch_action_labels = []
-        batch_observation_labels = []
-        for (
-            input_ids,
-            raw_action_labels,
-            raw_observation_labels,
-        ) in zip(
-            batch["input_ids"],
-            raw_batch_action_labels,
-            raw_batch_observation_labels,
-        ):
-            padding = [self.label_pad_token_id] * (
-                len(input_ids) - len(raw_action_labels)
-            )
-            if self.tokenizer.padding_side == "right":
-                action_labels = raw_action_labels + padding
-                observation_labels = raw_observation_labels + padding
-            else:
-                action_labels = padding + raw_action_labels
-                observation_labels = padding + raw_observation_labels
+        def pad_mask_batch(mask_batch):
+            padded_mask_batch = []
+            for labels, mask in zip(batch["labels"], mask_batch):
+                padding = [0] * (len(labels) - len(mask))
+                if self.tokenizer.padding_side == "right":
+                    padded_mask_batch.append(mask + padding)
+                else:
+                    padded_mask_batch.append(padding + mask)
 
-            batch_action_labels.append(action_labels)
-            batch_observation_labels.append(observation_labels)
+            if return_tensors == "pt":
+                return torch.tensor(padded_mask_batch)
+            elif return_tensors == "np":
+                return np.array(padded_mask_batch)
+            return padded_mask_batch
 
-        if return_tensors == "pt":
-            batch_action_labels = torch.tensor(batch_action_labels)
-            batch_observation_labels = torch.tensor(batch_observation_labels)
-        elif return_tensors == "np":
-            batch_action_labels = np.array(batch_action_labels)
-            batch_observation_labels = np.array(batch_observation_labels)
-
-        batch["action_labels"] = batch_action_labels
-        batch["observation_labels"] = batch_observation_labels
+        batch["action_mask"] = pad_mask_batch(action_mask_batch)
+        batch["observation_mask"] = pad_mask_batch(observation_mask_batch)
         return batch
 
 
 @dataclass
-class ECHOSFTConfig(SFTConfig):
+class MyTrainingArguments(TrainingArguments):
     observation_loss_weight: float = 0.1
+    # TODO: add config to enable chunked cross entropy
+    chunked_cross_entropy_chunk_size: int = 256
 
 
-class ECHOSFTTrainer(SFTTrainer):
+class MyTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.label_smoother = LabelSmoother(
-            epsilon=self.args.label_smoothing_factor,
-            ignore_index=self.data_collator.label_pad_token_id,
-        )
+        self.micro_step = 0
+        self.patch_model(self.model)
+
+    def patch_model(self, model):
+        model = self.accelerator.unwrap_model(model)
+        decoder = model.get_decoder()
+        output_embeddings = model.get_output_embeddings()
+
+        base_forward = model.forward
+
+        def forward(input_ids=None, attention_mask=None, labels=None, **kwargs):
+            if labels is None:
+                return base_forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+
+            kwargs["use_cache"] = False
+            hidden_state = decoder(
+                input_ids,
+                attention_mask,
+                **kwargs,
+            ).last_hidden_state
+
+            hidden_state = hidden_state[:, :-1, :]
+            labels = labels[:, 1:]
+
+            batch_size, seq_len, _ = hidden_state.shape
+            chunk_size = self.args.chunked_cross_entropy_chunk_size
+
+            def compute_per_token_loss_chunk(hidden_state_chunk, labels_chunk):
+                logits_chunk = output_embeddings(hidden_state_chunk)
+                return F.cross_entropy(
+                    logits_chunk.view(-1, logits_chunk.size(-1)),
+                    labels_chunk.view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                ).view(batch_size, -1)
+
+            # TODO: use checkpointing args
+            per_token_loss_chunks = []
+            for start in range(0, seq_len, chunk_size):
+                end = start + chunk_size
+                per_token_loss_chunks.append(
+                    torch.utils.checkpoint.checkpoint(
+                        compute_per_token_loss_chunk,
+                        hidden_state[:, start:end, :],
+                        labels[:, start:end],
+                        use_reentrant=False,
+                    ),
+                )
+            per_token_loss = torch.cat(per_token_loss_chunks, dim=-1)
+
+            return CausalLMOutputWithPast(loss=per_token_loss, logits=None)
+
+        model.forward = forward
 
     def compute_loss(
         self,
@@ -142,25 +193,39 @@ class ECHOSFTTrainer(SFTTrainer):
         return_outputs=False,
         num_items_in_batch=None,
     ):
-        action_labels = inputs.pop("action_labels")
-        observation_labels = inputs.pop("observation_labels")
+        self.micro_step += 1
+
+        action_mask = inputs.pop("action_mask")
+        observation_mask = inputs.pop("observation_mask")
 
         outputs = model(**inputs)
+        per_token_loss = outputs.loss
 
-        action_loss = self.label_smoother(
-            outputs,
-            action_labels,
-            shift_labels=True,
-            num_items_in_batch=num_items_in_batch,
+        logs = {"micro_step": self.micro_step}
+
+        def compute_and_log_masked_loss(loss_name, mask):
+            mask = mask[:, 1:]
+            masked_loss = (per_token_loss * mask).sum()
+
+            mask_sum = mask.sum()
+            if mask_sum != 0:
+                logs[loss_name] = (masked_loss / mask_sum).detach().item()
+
+            return masked_loss
+
+        action_loss = compute_and_log_masked_loss(
+            "action_loss",
+            action_mask,
         )
-        observation_loss = self.label_smoother(
-            outputs,
-            observation_labels,
-            shift_labels=True,
-            num_items_in_batch=num_items_in_batch,
+        observation_loss = compute_and_log_masked_loss(
+            "observation_loss",
+            observation_mask,
         )
+
+        self.log(logs)
+
         loss = action_loss + self.args.observation_loss_weight * observation_loss
-
+        loss = loss / (num_items_in_batch or inputs["labels"].size(-1))
         return (loss, outputs) if return_outputs else loss
 
 
@@ -172,27 +237,28 @@ def main(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(
         **OmegaConf.to_container(cfg.tokenizer, resolve=True)
     )
+    tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_dataset = load_dataset(**OmegaConf.to_container(cfg.dataset))
     train_dataset = tokenize_dataset(train_dataset, tokenizer=tokenizer)
 
-    data_collator = ECHODataCollator(
+    data_collator = MyDataCollator(
         **OmegaConf.to_container(cfg.data_collator, resolve=True),
         tokenizer=tokenizer,
     )
 
-    args = ECHOSFTConfig(
+    args = MyTrainingArguments(
         **OmegaConf.to_container(cfg.trainer, resolve=True),
         remove_unused_columns=False,
-        dataset_kwargs={"skip_prepare_dataset": True},
     )
-    trainer = ECHOSFTTrainer(
+    trainer = MyTrainer(
         model=model,
         args=args,
         train_dataset=train_dataset,
         data_collator=data_collator,
+        processing_class=tokenizer,
     )
     trainer.train()
 
