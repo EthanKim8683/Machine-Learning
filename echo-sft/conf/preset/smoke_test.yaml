@@ -10,4 +10,5 @@ dataset:
   split: "xml[:1]"
 
 trainer:
+  chunked_cross_entropy: true
   use_cpu: true

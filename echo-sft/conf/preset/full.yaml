@@ -10,17 +10,19 @@ tokenizer:
 dataset:
   path: data
   data_files: my-SWE-smith-trajectories.parquet
-  split: train[:2000]
+  split: train
 
 data_collator:
   pad_to_multiple_of: 8
 
 trainer:
   observation_loss_weight: 0.1
-  chunked_cross_entropy_chunk_size: 1024
+  chunked_cross_entropy: true
+  chunked_cross_entropy_kwargs:
+    chunk_size: 1024
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 32
-  num_train_epochs: 3
+  num_train_epochs: 1
   learning_rate: 5e-5
   lr_scheduler_type: cosine
   warmup_steps: 5

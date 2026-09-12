@@ -1,5 +1,6 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -121,8 +122,8 @@ class MyDataCollator(DataCollatorForSeq2Seq):
 @dataclass
 class MyTrainingArguments(TrainingArguments):
     observation_loss_weight: float = 0.1
-    # TODO: add config to enable/disable chunked cross entropy
-    chunked_cross_entropy_chunk_size: int = 256
+    chunked_cross_entropy: bool = False
+    chunked_cross_entropy_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 class MyTrainer(Trainer):
@@ -132,6 +133,9 @@ class MyTrainer(Trainer):
         self.patch_model(self.model)
 
     def patch_model(self, model):
+        if self.args.chunked_cross_entropy is False:
+            return
+
         model = self.accelerator.unwrap_model(model)
         decoder = model.get_decoder()
         output_embeddings = model.get_output_embeddings()
@@ -157,7 +161,7 @@ class MyTrainer(Trainer):
             labels = labels[:, 1:]
 
             batch_size, seq_len, _ = hidden_state.shape
-            chunk_size = self.args.chunked_cross_entropy_chunk_size
+            chunk_size = self.args.chunked_cross_entropy_kwargs.get("chunk_size", 256)
 
             def compute_per_token_loss_chunk(hidden_state_chunk, labels_chunk):
                 logits_chunk = output_embeddings(hidden_state_chunk)
@@ -168,18 +172,35 @@ class MyTrainer(Trainer):
                     reduction="none",
                 ).view(batch_size, -1)
 
-            # TODO: use checkpointing args
             per_token_loss_chunks = []
             for start in range(0, seq_len, chunk_size):
                 end = start + chunk_size
-                per_token_loss_chunks.append(
-                    torch.utils.checkpoint.checkpoint(
+
+                hidden_state_chunk = hidden_state[:, start:end, :]
+                labels_chunk = labels[:, start:end]
+
+                if self.args.gradient_checkpointing:
+                    gradient_checkpointing_kwargs = (
+                        self.args.gradient_checkpointing_kwargs or {}
+                    )
+                    use_reentrant = gradient_checkpointing_kwargs.get(
+                        "use_reentrant",
+                        False,
+                    )
+
+                    per_token_loss_chunk = torch.utils.checkpoint.checkpoint(
                         compute_per_token_loss_chunk,
-                        hidden_state[:, start:end, :],
-                        labels[:, start:end],
-                        use_reentrant=False,
-                    ),
-                )
+                        hidden_state_chunk,
+                        labels_chunk,
+                        use_reentrant=use_reentrant,
+                    )
+                else:
+                    per_token_loss_chunk = compute_per_token_loss_chunk(
+                        hidden_state_chunk,
+                        labels_chunk,
+                    )
+                per_token_loss_chunks.append(per_token_loss_chunk)
+
             per_token_loss = torch.cat(per_token_loss_chunks, dim=-1)
 
             return CausalLMOutputWithPast(loss=per_token_loss, logits=None)
