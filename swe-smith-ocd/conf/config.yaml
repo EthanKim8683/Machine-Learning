@@ -1,0 +1,15 @@
+defaults:
+  - _self_
+  - env: local
+
+model:
+  pretrained_model_name_or_path: ???
+tokenizer:
+  pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
+
+dataset:
+  path: "SWE-bench/SWE-smith-trajectories"
+  split: "xml"
+
+trainer:
+  output_dir: "trainer_outputs"

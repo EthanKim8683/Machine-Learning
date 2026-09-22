@@ -10,7 +10,7 @@ tokenizer:
 dataset:
   path: data
   data_files: my-SWE-smith-trajectories.parquet
-  split: train
+  split: train[:5000]
 
 data_collator:
   pad_to_multiple_of: 8
@@ -38,5 +38,4 @@ trainer:
   save_total_limit: 2
   logging_steps: 1
   report_to: wandb
-  run_name: train
-  
+  run_name: train-v2

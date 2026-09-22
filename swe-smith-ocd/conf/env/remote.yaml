@@ -1,0 +1,4 @@
+# @package _global_
+
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen2.5-Coder-7B-Instruct"
