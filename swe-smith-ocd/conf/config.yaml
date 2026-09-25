@@ -1,15 +1,19 @@
 defaults:
   - _self_
-  - env: local
+  - env: null
 
 model:
   pretrained_model_name_or_path: ???
+
 tokenizer:
   pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
 
 dataset:
-  path: "SWE-bench/SWE-smith-trajectories"
-  split: "xml"
+  path: data
+  data_files: swe_smith.parquet
+  split: "train"
+
+dataset_map: {}
 
 trainer:
-  output_dir: "trainer_outputs"
+  output_dir: trainer_outputs

@@ -1,4 +1,41 @@
 # @package _global_
 
+defaults:
+  - _self_
+  - /chat_template/qwen@_here_
+
 model:
   pretrained_model_name_or_path: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+tokenizer:
+  model_max_length: 16384
+
+dataset_map:
+  num_proc: 4
+
+trainer:
+  bf16: true
+  tf32: true
+  optim: paged_adamw_8bit
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  learning_rate: 1.0e-5
+  lr_scheduler_type: cosine
+  warmup_steps: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  num_train_epochs: 1
+  logging_steps: 10
+  save_strategy: steps
+  save_steps: 200
+  save_total_limit: 2
+  report_to: wandb
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  chunked_kl_div_chunk_size: 512

@@ -1,7 +1,14 @@
 # @package _global_
 
+defaults:
+  - _self_
+  - /chat_template/qwen@_here_
+
 model:
   pretrained_model_name_or_path: "yujiepan/qwen2.5-tiny-random"
 
+tokenizer:
+  model_max_length: 1
+
 dataset:
-  split: "xml[:1]"
+  split: "train[:1]"
