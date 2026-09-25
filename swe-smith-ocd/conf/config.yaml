@@ -2,6 +2,10 @@ defaults:
   - _self_
   - env: null
 
+hydra:
+  job:
+    chdir: false
+
 model:
   pretrained_model_name_or_path: ???
 
