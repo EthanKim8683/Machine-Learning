@@ -8,7 +8,17 @@ model:
   pretrained_model_name_or_path: "yujiepan/qwen2.5-tiny-random"
 
 tokenizer:
-  model_max_length: 1
+  model_max_length: 2048
 
 dataset:
   split: "train[:1]"
+
+trainer:
+  max_steps: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  save_strategy: "no"
+  report_to: "none"
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+  chunked_kl_div_chunk_size: 256

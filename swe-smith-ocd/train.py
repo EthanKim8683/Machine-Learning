@@ -39,7 +39,6 @@ def transform_batch(
         "state_input_ids": tokenized_state["input_ids"],
         "state_attention_mask": tokenized_state["attention_mask"],
         "state_assistant_mask": tokenized_state["assistant_masks"],
-        "resolved": batch["resolved"],
     }
 
 
@@ -78,15 +77,12 @@ class MyDataCollator:
             batch_first=True,
         )
 
-        resolved = [feature["resolved"] for feature in features]
-
         return {
             "context_input_ids": padded_context["input_ids"],
             "context_attention_mask": padded_context["attention_mask"],
             "state_input_ids": padded_state["input_ids"],
             "state_attention_mask": padded_state["attention_mask"],
             "state_assistant_mask": state_assistant_mask,
-            "resolved": resolved,
         }
 
 
@@ -133,28 +129,32 @@ class MyTrainer(Trainer):
 
         assistant_mask = inputs["state_assistant_mask"]
 
-        shifted_teacher_last_hidden_state = teacher_last_hidden_state[:, inputs["context_input_ids"].shape[1]:-1]
-        shifted_student_last_hidden_state = student_last_hidden_state[:, :-1]
-        shifted_assistant_mask = assistant_mask[:, 1:]
+        device_type = self.accelerator.device.type
+        dtype = self.head.weight.dtype
 
         def compute_loss(
             teacher_last_hidden_state,
             student_last_hidden_state,
             assistant_mask,
         ):
-            with torch.no_grad():
-                self.head.eval()
-                teacher_logits = self.head(teacher_last_hidden_state)
-                self.head.train()
+            with torch.autocast(device_type=device_type, dtype=dtype):
+                with torch.no_grad():
+                    self.head.eval()
+                    teacher_logits = self.head(teacher_last_hidden_state)
+                    self.head.train()
 
-            student_logits = self.head(student_last_hidden_state)
+                student_logits = self.head(student_last_hidden_state)
 
             kl_divergence = torch.nn.functional.kl_div(
-                torch.log_softmax(student_logits, dim=-1),
-                torch.softmax(teacher_logits, dim=-1),
+                torch.log_softmax(student_logits.float(), dim=-1),
+                torch.softmax(teacher_logits.float(), dim=-1),
                 reduction="none",
             ).sum(dim=-1)
             return (kl_divergence * assistant_mask).sum()
+
+        shifted_teacher_last_hidden_state = teacher_last_hidden_state[:, inputs["context_input_ids"].shape[1]:-1]
+        shifted_student_last_hidden_state = student_last_hidden_state[:, :-1]
+        shifted_assistant_mask = assistant_mask[:, 1:]
         
         chunk_size = self.args.chunked_kl_div_chunk_size
         loss = 0
