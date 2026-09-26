@@ -29,9 +29,8 @@ tokenizer:
         {%- elif message.role == "assistant" and not message.tool_calls %}
             {{- '<|im_start|>' + message.role + '\n' }}
             {%- generation %}
-            {{- message.content }}
+            {{- message.content + '<|im_end|>\n' }}
             {%- endgeneration %}
-            {{- '<|im_end|>' + '\n' }}
         {%- elif message.role == "assistant" %}
             {{- '<|im_start|>' + message.role }}
             {%- generation %}
@@ -48,8 +47,8 @@ tokenizer:
                 {{- tool_call.arguments | tojson }}
                 {{- '}\n</tool_call>' }}
             {%- endfor %}
-            {%- endgeneration %}
             {{- '<|im_end|>\n' }}
+            {%- endgeneration %}
         {%- elif message.role == "tool" %}
             {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
                 {{- '<|im_start|>user' }}
