@@ -1,5 +1,0 @@
-outputs/
-trainer_outputs/
-data/
-.venv/
-.env
