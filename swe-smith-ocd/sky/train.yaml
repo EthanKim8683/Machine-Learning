@@ -2,6 +2,9 @@ resources:
   infra: runpod
   accelerators: A100-80GB:1
   disk_size: 256
+  autostop:
+    idle_minutes: 10
+    down: true
 
 workdir: .
 
